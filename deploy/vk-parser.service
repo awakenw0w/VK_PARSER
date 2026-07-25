@@ -1,0 +1,22 @@
+[Unit]
+Description=VK Parser Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vkparser
+Group=vkparser
+WorkingDirectory=/opt/vk-parser
+ExecStart=/opt/vk-parser/.venv/bin/python -m vk_chat_bot
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/opt/vk-parser/data
+
+[Install]
+WantedBy=multi-user.target
