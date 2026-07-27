@@ -8,7 +8,7 @@ from contextlib import suppress
 from datetime import UTC, datetime
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
+from aiogram.exceptions import TelegramAPIError
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from vk_chat_bot.models import SearchRun, SearchStatus
@@ -17,6 +17,8 @@ from vk_chat_bot.search_service import SearchProcessor
 from vk_chat_bot.vk_client import VKAuthenticationError, VKCaptchaError, VKError
 
 logger = logging.getLogger(__name__)
+
+PROGRESS_EDIT_INTERVAL = 3.0
 
 STAGE_LABELS = {
     "queued": "Ожидает запуска",
@@ -78,7 +80,11 @@ class SearchWorker:
         stage_finished = bool(
             search.progress_total and search.progress_current >= search.progress_total
         )
-        if search.progress_stage == previous_stage and now - previous_at < 1.25 and not stage_finished:
+        if (
+            search.progress_stage == previous_stage
+            and now - previous_at < PROGRESS_EDIT_INTERVAL
+            and not stage_finished
+        ):
             return
         self._last_progress_edit[search.id] = (search.progress_stage, now)
         keyboard = InlineKeyboardMarkup(
@@ -86,7 +92,9 @@ class SearchWorker:
                 [InlineKeyboardButton(text="Отменить", callback_data=f"cancel:{search.id}")]
             ]
         )
-        with suppress(TelegramBadRequest, TelegramNetworkError):
+        # Progress delivery is best-effort. Telegram flood control, a deleted
+        # message or a blocked bot must never abort the VK search itself.
+        with suppress(TelegramAPIError):
             await self._bot.edit_message_text(
                 self.progress_text(search),
                 chat_id=search.telegram_chat_id,
@@ -148,7 +156,8 @@ class SearchWorker:
             error = html.escape(search.error_message or "Неизвестная ошибка")
             text = f"❌ Поиск завершился с ошибкой.\n{error}"
             keyboard = None
-        with suppress(TelegramBadRequest, TelegramNetworkError):
+        # A failed final edit must not terminate the sequential search worker.
+        with suppress(TelegramAPIError):
             await self._bot.edit_message_text(
                 text,
                 chat_id=search.telegram_chat_id,
@@ -192,12 +201,36 @@ class SearchWorker:
 
     async def _loop(self) -> None:
         while not self._stop.is_set():
-            search = await self._repository.claim_next_search()
-            if search is None:
-                self._wake.clear()
-                try:
-                    await asyncio.wait_for(self._wake.wait(), timeout=2.0)
-                except TimeoutError:
-                    pass
-                continue
-            await self._process(search)
+            search: SearchRun | None = None
+            try:
+                search = await self._repository.claim_next_search()
+                if search is None:
+                    self._wake.clear()
+                    try:
+                        await asyncio.wait_for(self._wake.wait(), timeout=2.0)
+                    except TimeoutError:
+                        pass
+                    continue
+                await self._process(search)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "Search worker loop recovered after an unexpected failure search_id=%s",
+                    search.id if search else None,
+                )
+                if search is not None:
+                    with suppress(Exception):
+                        current = await self._repository.get_search(search.id)
+                        if current and current.status == SearchStatus.RUNNING.value:
+                            await self._repository.update_search(
+                                search.id,
+                                status=SearchStatus.FAILED.value,
+                                progress_stage="failed",
+                                error_message=(
+                                    "Внутренняя ошибка. "
+                                    "Фоновый обработчик продолжил работу."
+                                ),
+                                completed_at=datetime.now(UTC),
+                            )
+                await asyncio.sleep(1.0)

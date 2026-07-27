@@ -56,8 +56,10 @@ async def set_commands(bot: Bot) -> None:
 
 async def main(settings: Settings | None = None) -> None:
     settings = settings or get_settings()
-    configure_logging(settings.log_level)
     await asyncio.to_thread(upgrade_database, settings.database_url)
+    # Alembic installs its own logging configuration while migrations run.
+    # Restore the application loggers afterwards so worker failures reach the journal.
+    configure_logging(settings.log_level)
 
     engine = create_engine(settings.database_url)
     sessions = create_session_factory(engine)
