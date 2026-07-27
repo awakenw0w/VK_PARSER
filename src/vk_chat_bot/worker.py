@@ -8,7 +8,7 @@ from contextlib import suppress
 from datetime import UTC, datetime
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from vk_chat_bot.models import SearchRun, SearchStatus
@@ -39,6 +39,7 @@ class SearchWorker:
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._last_progress_edit: dict[int, tuple[str, float]] = {}
+        self._progress_blocked_until: dict[int, float] = {}
 
     async def start(self) -> None:
         await self._repository.requeue_interrupted()
@@ -76,6 +77,8 @@ class SearchWorker:
         if not search.telegram_chat_id or not search.telegram_message_id:
             return
         now = time.monotonic()
+        if self._progress_blocked_until.get(search.telegram_chat_id, 0.0) > now:
+            return
         previous_stage, previous_at = self._last_progress_edit.get(search.id, ("", 0.0))
         stage_finished = bool(
             search.progress_total and search.progress_current >= search.progress_total
@@ -94,12 +97,27 @@ class SearchWorker:
         )
         # Progress delivery is best-effort. Telegram flood control, a deleted
         # message or a blocked bot must never abort the VK search itself.
-        with suppress(TelegramAPIError):
+        try:
             await self._bot.edit_message_text(
                 self.progress_text(search),
                 chat_id=search.telegram_chat_id,
                 message_id=search.telegram_message_id,
                 reply_markup=keyboard,
+            )
+        except TelegramRetryAfter as exc:
+            self._progress_blocked_until[search.telegram_chat_id] = (
+                time.monotonic() + exc.retry_after
+            )
+            logger.warning(
+                "Telegram progress edits paused chat_id=%s retry_after=%s",
+                search.telegram_chat_id,
+                exc.retry_after,
+            )
+        except TelegramAPIError as exc:
+            logger.warning(
+                "Telegram progress edit failed chat_id=%s error=%s",
+                search.telegram_chat_id,
+                type(exc).__name__,
             )
 
     async def _notify_finished(self, search: SearchRun) -> None:
@@ -156,14 +174,46 @@ class SearchWorker:
             error = html.escape(search.error_message or "Неизвестная ошибка")
             text = f"❌ Поиск завершился с ошибкой.\n{error}"
             keyboard = None
-        # A failed final edit must not terminate the sequential search worker.
-        with suppress(TelegramAPIError):
+        async def send_fallback() -> None:
+            with suppress(TelegramAPIError):
+                await self._bot.send_message(
+                    search.telegram_chat_id,
+                    text,
+                    reply_markup=keyboard,
+                )
+
+        # If progress edits are under flood control, deliver the result as a
+        # fresh message instead of leaving a stale progress card on screen.
+        edits_blocked_until = self._progress_blocked_until.get(search.telegram_chat_id, 0.0)
+        if edits_blocked_until > time.monotonic():
+            await send_fallback()
+            return
+
+        try:
             await self._bot.edit_message_text(
                 text,
                 chat_id=search.telegram_chat_id,
                 message_id=search.telegram_message_id,
                 reply_markup=keyboard,
             )
+        except TelegramRetryAfter as exc:
+            self._progress_blocked_until[search.telegram_chat_id] = (
+                time.monotonic() + exc.retry_after
+            )
+            logger.warning(
+                "Telegram final edit rate-limited chat_id=%s retry_after=%s; "
+                "sending a new message",
+                search.telegram_chat_id,
+                exc.retry_after,
+            )
+            await send_fallback()
+        except TelegramAPIError as exc:
+            logger.warning(
+                "Telegram final edit failed chat_id=%s error=%s; sending a new message",
+                search.telegram_chat_id,
+                type(exc).__name__,
+            )
+            await send_fallback()
 
     async def _process(self, search: SearchRun) -> None:
         try:
